@@ -14,12 +14,16 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import os
 import torch
 import math
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
 from transformers import Trainer
+from transformers.trainer import OPTIMIZER_NAME, SCHEDULER_NAME, TRAINER_STATE_NAME
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
+from transformers.trainer_utils import get_last_checkpoint, PREFIX_CHECKPOINT_DIR
+from transformers.trainer_callback import TrainerState
 from tqdm import tqdm as ProgressBar
 from packaging.version import Version
 from transformers.models.llama.modeling_llama import logger
@@ -114,13 +118,24 @@ def unset_training(model):
 pass
 
 
+def save_checkpoint(trainer, optimizer, lr_scheduler, args, checkpoint_dir:str, step:int):
+    output_dir = os.path.join(checkpoint_dir, f"{PREFIX_CHECKPOINT_DIR}-{step}")
+    trainer.save_model(output_dir, _internal_call = False)
+    if args.should_save:
+        trainer.state.stateful_callbacks["TrainerControl"] = trainer.control.state()
+        trainer.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+        torch.save(optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+        torch.save(lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
+
 from dataclasses import dataclass
 @dataclass
 class Trainer_Stats:
     metrics: dict
 pass
 
-def unsloth_train(trainer):
+
+def unsloth_train(trainer, resume_from_checkpoint):
     """
     Unsloth Trainer
     1. Fixes gradient accumulation
@@ -132,8 +147,30 @@ def unsloth_train(trainer):
     assert(hasattr(trainer, "train_dataset"))
     assert(hasattr(trainer, "data_collator"))
 
-    model = trainer.model
     training_args = trainer.args
+    output_dir = training_args.output_dir
+    
+    if resume_from_checkpoint is False:
+        resume_from_checkpoint = None
+
+    # Load potential model checkpoint
+    if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
+        resume_from_checkpoint = get_last_checkpoint(output_dir)
+        if resume_from_checkpoint is None:
+            raise ValueError(f"No valid checkpoint found in output directory ({output_dir})")
+        
+    if resume_from_checkpoint is not None:
+        trainer._load_from_checkpoint(resume_from_checkpoint)
+
+    if resume_from_checkpoint is not None and os.path.isfile(
+        os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)):
+        trainer.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+        # This line currently does not work as trainer.state does not seem to be updated with the values from the training arguments.
+        #trainer.compare_trainer_and_checkpoint_args(training_args, trainer.state)
+        trainer._load_callback_state()
+
+    model = trainer.model
+
     data_collator = trainer.data_collator
     n_training_samples = len(trainer.train_dataset)
     set_training(model)
@@ -217,9 +254,11 @@ def unsloth_train(trainer):
         )
     pass
 
-    step = 0
+    step = trainer.state.global_step
     accumulated_loss = torch.zeros(1, device = "cuda:0", dtype = torch.float32)[0]
     max_iterations   = int(math.ceil(n_training_samples / gradient_accumulation_steps))
+    num_trained_epochs = trainer.state.global_step // max_iterations
+    num_trained_steps = step - (max_iterations * num_train_epochs)
     leftover_batches = n_training_samples % gradient_accumulation_steps
     if leftover_batches == 0: leftover_batches = gradient_accumulation_steps
 
@@ -231,11 +270,13 @@ def unsloth_train(trainer):
         f' "-____-"     Number of trainable parameters = {n_parameters_to_train:,}'
     logger.warning(debug_info)
 
-    progress_bar = ProgressBar(total = max_steps*num_train_epochs, dynamic_ncols = True)
+    progress_bar = ProgressBar(total = max_steps*num_train_epochs, initial = step, dynamic_ncols = True)
     logging_steps = training_args.logging_steps
+    save_strategy = training_args.save_strategy
+    save_steps = training_args.save_steps
     # Go through each epoch
     start_time = time.time()
-    for epoch in range(num_train_epochs):
+    for epoch in range(num_trained_epochs, num_train_epochs):
 
         # We also need to shuffle the data loader every epoch!
         transformers_set_seed(training_args.seed + epoch)
@@ -250,7 +291,8 @@ def unsloth_train(trainer):
             worker_init_fn = trainer_utils_seed_worker,
         ))
 
-        for j in range(max_iterations):
+        
+        for j in range(num_trained_steps, max_iterations):
             n_batches = leftover_batches if j == (max_iterations-1) else gradient_accumulation_steps
             batches = [next(train_dataloader_iterator) for j in range(n_batches)]
                 
@@ -293,7 +335,18 @@ def unsloth_train(trainer):
 
             step += 1
             if step == max_steps: break
+
+            if save_strategy !="epoch":
+                # Should save checkpoints to output directory
+                if step % save_steps == 0 and save_steps >= 1 and step != 0:
+                    save_checkpoint(trainer, optimizer, lr_scheduler, training_args, checkpoint_dir=output_dir, step = step)
+                elif step == int(max_steps * save_steps) and save_steps > 0:
+                    save_checkpoint(trainer, optimizer, lr_scheduler, training_args, checkpoint_dir=output_dir, step = step)
         pass
+
+        if save_strategy == "epoch":
+            save_checkpoint(trainer, optimizer, lr_scheduler, training_args, checkpoint_dir=output_dir, step = step)
+
     pass
     progress_bar.close()
     unset_training(model)
